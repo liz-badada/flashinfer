@@ -126,6 +126,7 @@ Whole layer (`K3MoELayerTP8`), one CUDA graph of 32 layer calls, worst rank, us 
 | M | 1 | 8 | 32 |
 |---|---|---|---|
 | H200 layer graph (min / median) | 213.8 / 214.3 | 279.8 / 280.2 | 371.3 / 372.0 |
+| H200 layer graph, sglang image, NCCL 2.30.7 NVLS off (job 5509039, viking-prod-214) | 227.6 | 319.6 | 405.6 |
 | of which the kernel | 40 | 79 | 126 |
 | H200 layer eager | 802 | 471 | 479 |
 | H20 layer graph | 198 | 314 | 453 |
@@ -181,6 +182,48 @@ therefore (1) fusing the tail (RMSNorm, W_up, shared expert, final reduce) into 
 W_down with the all-gather on NVLink inside the kernel, and only then (3) the kernel's own M = 1 latency. At M = 1 that is a
 reachable 5-8x on the MoE block; the decode step as a whole also carries attention and the 46 x 2 pipeline stages.
 
+### Comparison with the industry kernels on H200 (`bench/bench_baselines.py`, `bench/nccl_ar.py`)
+
+Same idle node (viking-prod-309, computelab job 5508653, `sglang_v0.5.22` image: torch 2.14.1+cu130, sgl_kernel 0.4.9, flashinfer 0.7.1,
+NCCL 2.30.7), same TP8 shard (896 experts, 3584 x 384 per rank, top-16, SiTU), **identical routing** (`test_k3.random_routing`, so the
+unique-expert counts and the bytes match), same measurement (CUDA graph of 32 back-to-back calls, us per call, min over 30 replays).
+The baselines are the paths SGLang runs for Kimi K3 MXFP4 on Hopper, built through SGLang's own weight preparation code:
+
+- **Marlin MXFP4 W4A16** (`--moe-runner-backend marlin`: `prepare_moe_mxfp4_layer_for_marlin` + `fused_marlin_moe`, E8M0 scales, BF16
+  activations, fused SiTU) -- the same bytes as our kernel.
+- **FlashInfer cutlass W4A16** (`flashinfer_mxfp4` on SM90: `cutlass_fused_moe(use_w4_group_scaling=True)` + SM90 interleave, SiTU).
+- **FlashInfer Humming W4A8** (`flashinfer_mxfp4` with `precision=fp8`: `use_wfp4afp8_humming=True`, FP8 activations, SiTU) -- the kernel
+  family tp4moe2 was measured against in DeepSeek serving.
+- Not run: vLLM (not in the image; its K3 Hopper path is the same Marlin kernel), SGLang Triton BF16 fused_experts (needs the server's
+  parallel context; W16, 4x the bytes, not a contender), and this repo's `cake_fused_moe` / `kimi_k3_latent_moe` K3 kernels (sm_100a /
+  sm_103a only).
+
+Routed experts only, one GPU (the baselines have no cross-rank reduce; our TP8 figure includes the 8-way reduce):
+
+| M | 1 | 2 | 4 | 8 | 16 | 32 |
+|---|---|---|---|---|---|---|
+| unique experts / bytes per rank, MB | 16 / 35 | 28 / 61 | 51 / 112 | 88 / 193 | 121 / 265 | 153 / 336 |
+| **ours, single GPU (ndev 1)** | **36.7** | **44.3** | **56.7** | **74.5** | **92.5** | **113.6** |
+| **ours, TP8 incl. 8-way reduce** | **39.6** | **47.3** | **60.4** | **78.9** | **98.4** | **125.8** |
+| Marlin MXFP4 W4A16 | 33.4 | 44.5 | 70.3 | 101.1 | 133.9 | 168.2 |
+| FlashInfer cutlass W4A16 | 81.4 | 102.8 | 137.0 | 191.4 | 240.1 | 292.2 |
+| FlashInfer Humming W4A8 | 78.2 | 95.6 | 125.4 | 173.2 | 215.8 | 259.2 |
+| NCCL all-reduce [M, 3584] bf16 x 8 (what a baseline adds under TP8) | 21.9 | 22.3 | 23.4 | 27.2 | 26.7 | 21.8 |
+| ours ndev 1 vs Marlin | 0.91x | 1.00x | 1.24x | 1.36x | 1.45x | 1.48x |
+| ours ndev 1 vs Humming W4A8 | 2.13x | 2.16x | 2.21x | 2.32x | 2.33x | 2.28x |
+| ours TP8 vs Marlin + NCCL | 1.40x | 1.41x | 1.55x | 1.63x | 1.63x | 1.51x |
+| achieved HBM TB/s: ours ndev 1 / Marlin / Humming | 0.96 / 1.05 / 0.45 | 1.39 / 1.38 / 0.64 | 1.97 / 1.59 / 0.89 | 2.59 / 1.91 / 1.11 | 2.87 / 1.98 / 1.23 | 2.95 / 2.00 / 1.29 |
+| % of SOL at 4.0 TB/s: ours ndev 1 / Marlin / Humming | 24 / 26 / 11 | 35 / 35 / 16 | 49 / 40 / 22 | 65 / 48 / 28 | 72 / 50 / 31 | 74 / 50 / 32 |
+
+Reading: from M = 4 the kernel is the fastest of the set by a growing margin (1.24-1.48x over Marlin, 2.1-2.3x over Humming, 2.2-2.6x
+over the cutlass W4A16 path) and reaches 65-74 % of achievable HBM bandwidth where Marlin plateaus at 50 % and Humming at ~30 %. As a
+TP8 layer (kernel + reduce) it is 1.4-1.6x ahead of Marlin + NCCL at every M. **At M = 1 it is not the fastest kernel: Marlin is 3.3 us
+(9 %) faster on the expert part** (33.4 vs 36.7 us; both ~25 % of SOL), and the two tie at M = 2. That is the latency floor described
+in the SOL section (one wave of 16 narrow panels, FC1 -> FC2 dependency, 16-slot combine, one-shot barrier); Marlin's single
+moe_wna16 GEMM per stage has less fixed cost at one token. The NCCL figure is torch.distributed NCCL 2.30.7 with NVLS disabled
+(`NCCL_NVLS_ENABLE=0`: the multicast bind fails in this container); SGLang's custom one-shot all-reduce would be a few us lower, which
+does not change the ranking.
+
 **Two-node run, TP8 x PP2 on 2 x 8 H200** (job 5377802, viking-prod-214 + viking-prod-297, torchrun 2 x 8, NCCL 2.27.7 world over
 the inter-node link, 2 MoE layers per stage, 896 experts; `k3_pp2.sbatch`):
 
@@ -234,7 +277,7 @@ $PY k3_pp2.py --layers 2 --ms 1 8 --nexp 32 --colocated --time  # TP8 x PP2 rehe
 
 1. Tail fusion: RMSNorm + W_up K-slice + shared-expert shard + 7168-wide reduce inside the kernel (second LL stage) instead of torch + NCCL.
 2. Sharded router + W_down GEMM with an NVLink all-gather of z (today: torch GEMM + NCCL all-gather).
-3. Dense mode (M <= 8) and small-M latency work (the M = 1 gap).
+3. Dense mode (M <= 8) and small-M latency work: the M = 1 gap to SOL and the 3 us Marlin leads by at one token.
 4. Activation quantization: K3 was trained with MXFP8 (per-32-group) activations; the kernel uses per-token FP8. Evaluate on real weights.
 5. RS + AG tail for M > 32 / larger prefill-ish batches; M * topk > 512 tables.
 6. Engine hook (SGLang / vLLM K3 model) with 46 layers per stage; CUDA-graph the whole stage incl. the hop.
