@@ -1,6 +1,6 @@
-"""End-to-end TP8 check of one K3 MoE layer (k3_layer.K3MoELayerTP8) against k3_ref.k3_block_ref with torch-reference experts.
+"""End-to-end TP8 check of one K3 MoE layer (moe_layer.MoELayerTP8) against moe_ref.moe_block_ref with torch-reference experts.
 
-  python test_k3_layer.py --ms 1 8 32 [--nexp 128] [--time]
+  python test_layer.py --ms 1 8 32 [--nexp 128] [--time]
 """
 import argparse
 import os
@@ -14,11 +14,11 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import k3_host as H   # noqa: E402
-import k3_ref as R   # noqa: E402
-import k3_synth as S   # noqa: E402
-from k3_layer import K3MoELayerTP8, HID, LAT, SH_INTER, NDEV   # noqa: E402
-from test_k3 import CudaRT, stats   # noqa: E402
+import tp8moe_host as H   # noqa: E402
+import moe_ref as R   # noqa: E402
+import mx_synth as S   # noqa: E402
+from moe_layer import MoELayerTP8, HID, LAT, SH_INTER, NDEV   # noqa: E402
+from test_tp8moe import CudaRT, stats   # noqa: E402
 
 
 def dense_weights(device, seed=7):
@@ -43,7 +43,7 @@ def worker(rank, args):
     torch.cuda.synchronize(); dist.barrier()
     experts = S.make_expert_weights(args.nexp, dev, seed=1 + rank, keep_dq=True)   # this rank's intermediate shard of every expert
     D = dense_weights(dev)
-    layer = K3MoELayerTP8(rank, st, experts, **D)
+    layer = MoELayerTP8(rank, st, experts, **D)
 
     def rank_fn_ref(z, ids, rw):   # torch-reference experts on every rank + exact TP combine
         mine = R.routed_local(z, ids, rw, experts['dq1'], experts['dq2'])
@@ -58,7 +58,7 @@ def worker(rank, args):
         torch.cuda.synchronize()
         y2 = layer.forward(x)
         torch.cuda.synchronize()
-        yref = R.k3_block_ref(x, D['gate_w'], D['gate_bias'], D['down_w'], D['up_w'], D['norm_w'], D['sh_gate'], D['sh_up'], D['sh_down'], rank_fn_ref)
+        yref = R.moe_block_ref(x, D['gate_w'], D['gate_bias'], D['down_w'], D['up_w'], D['norm_w'], D['sh_gate'], D['sh_up'], D['sh_down'], rank_fn_ref)
         rr, tr = stats(y, yref)
         ys = [torch.empty_like(y) for _ in range(NDEV)]
         dist.all_gather(ys, y)
@@ -114,7 +114,7 @@ def main():
     ap.add_argument('--ms', type=int, nargs='+', default=[1, 8, 32]); ap.add_argument('--nexp', type=int, default=128)
     ap.add_argument('--time', action='store_true'); ap.add_argument('--copies', type=int, default=8); ap.add_argument('--reps', type=int, default=20)
     args = ap.parse_args()
-    args.rdv = tempfile.mktemp(prefix='k3l_rdv_')
+    args.rdv = tempfile.mktemp(prefix='tp8moe_rdv_')
     mp.spawn(worker, args=(args,), nprocs=NDEV, join=True)
 
 

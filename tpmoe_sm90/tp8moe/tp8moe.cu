@@ -2496,7 +2496,7 @@ __device__ __forceinline__ void tail(const Params& P, const Tabs& T, int tid, un
 }
 
 // ------------------------------------------------------------------------------------------------ kernel
-__global__ void __launch_bounds__(NTHREADS, 1) k3tp8moe_kernel(const __grid_constant__ Params P) {
+__global__ void __launch_bounds__(NTHREADS, 1) tp8moe_kernel(const __grid_constant__ Params P) {
     extern __shared__ uint8_t smem_raw[];
     const uint32_t raw = smem_u32(smem_raw);
     uint8_t* smem = smem_raw + (((raw + 1023u) & ~1023u) - raw);
@@ -3002,7 +3002,7 @@ void run(torch::Tensor xq, torch::Tensor xs, torch::Tensor w1, torch::Tensor s1,
     if (P.dbg) TORCH_CHECK(dbg.numel() >= (int64_t)grid * NSTAMP, "dbg too small");
 #endif
     if (!attr[dev]) {
-        TORCH_CHECK(cudaFuncSetAttribute(k3tp8moe_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_ALLOC) == cudaSuccess, "smem attribute");
+        TORCH_CHECK(cudaFuncSetAttribute(tp8moe_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_ALLOC) == cudaSuccess, "smem attribute");
         attr[dev] = true;
     }
     static const int pdl = getenv("TP2_PDL") ? atoi(getenv("TP2_PDL")) : 0;   // 0 off, 1 tables before the wait, 2 wait first
@@ -3012,7 +3012,7 @@ void run(torch::Tensor xq, torch::Tensor xs, torch::Tensor w1, torch::Tensor s1,
     cudaLaunchAttribute at[1];
     at[0].id = cudaLaunchAttributeProgrammaticStreamSerialization; at[0].val.programmaticStreamSerializationAllowed = 1;
     cfg.attrs = at; cfg.numAttrs = pdl ? 1 : 0;
-    TORCH_CHECK(cudaLaunchKernelEx(&cfg, k3tp8moe_kernel, P) == cudaSuccess, "launch");
+    TORCH_CHECK(cudaLaunchKernelEx(&cfg, tp8moe_kernel, P) == cudaSuccess, "launch");
     const cudaError_t e = cudaGetLastError();
     TORCH_CHECK(e == cudaSuccess, "launch failed: ", cudaGetErrorString(e));
 }

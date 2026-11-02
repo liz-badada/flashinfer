@@ -1,4 +1,4 @@
-"""Torch reference of k3tp8moe's numerics (one rank's routed experts in the latent space, TP combine) and of the whole K3 MoE block."""
+"""Torch reference of tp8moe's numerics (one rank's routed experts in the latent space, TP combine) and of the whole K3 MoE block."""
 import torch
 
 DIM, INTER, NEXP, TOPK = 3584, 384, 896, 16
@@ -73,7 +73,7 @@ def rmsnorm(x, w, eps=1e-5):
     return (xf * torch.rsqrt(xf.square().mean(-1, keepdim=True) + eps)) * w.float()
 
 
-def k3_block_ref(x, gate_w, gate_bias, down_w, up_w, norm_w, sh_gate, sh_up, sh_down, rank_fn):
+def moe_block_ref(x, gate_w, gate_bias, down_w, up_w, norm_w, sh_gate, sh_up, sh_down, rank_fn):
     """Whole KimiSparseMoeBlock (eval): x [M, 7168] BF16 -> y [M, 7168] BF16.  rank_fn(z_bf16, ids, rw) returns the TP-reduced routed
     latent output [M, DIM] (BF16) -- the kernel path or routed_local + combine_tp.  BF16 module boundaries as the HF modeling code."""
     logits = x.float() @ gate_w.float().t()

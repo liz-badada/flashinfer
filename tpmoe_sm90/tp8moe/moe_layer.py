@@ -1,4 +1,4 @@
-"""One Kimi K3 MoE layer on TP8 (intra-node), v0 composition: the routed experts run in k3tp8moe (fused FC1 / SiTU / FC2 + 8-way one-shot
+"""One Kimi K3 MoE layer on TP8 (intra-node), v0 composition: the routed experts run in tp8moe (fused FC1 / SiTU / FC2 + 8-way one-shot
 LL reduce of the latent sum); the rest is torch + NCCL:
   router (replicated, [896, 7168])            -> ids / weights          (torch sigmoid gate, K3 KimiMoEGate semantics)
   W_down sharded by output rows (448 / rank)  -> z_r, all-gather -> z   (NCCL)
@@ -11,13 +11,13 @@ LL reduce of the latent sum); the rest is torch + NCCL:
 import torch
 import torch.distributed as dist
 
-import k3_host as H
-import k3_ref as R
+import tp8moe_host as H
+import moe_ref as R
 
 HID, LAT, SH_INTER, NEXP, TOPK, NDEV = 7168, 3584, 6144, 896, 16, 8
 
 
-class K3MoELayerTP8:
+class MoELayerTP8:
     def __init__(self, rank, state, experts, gate_w, gate_bias, down_w, up_w, norm_w, sh_gate, sh_up, sh_down, group=None):
         """experts: kernel-layout weights of this rank's intermediate shard (dict w1 s1 f1 w2 s2 f2).  Full BF16 tensors for the
         dense parts are sharded here (down_w [3584, 7168] -> rows, up_w [7168, 3584] -> columns, shared [6144, 7168] / [7168, 6144])."""

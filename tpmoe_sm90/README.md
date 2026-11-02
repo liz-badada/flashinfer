@@ -5,9 +5,9 @@ Two packages share one kernel design (persistent MXFP4 W4A8 expert kernel with t
 | directory | model / layout | status |
 |---|---|---|
 | `serving_tp4moe2_v26/` | DeepSeek-V4-Flash, TP4 on 4x H20 | frozen serving package (SHA-pinned), measured in SGLang 1P1D |
-| `k3_tp8moe/` | Kimi K3 Stable LatentMoE (896 experts, top-16, latent 3584), TP8 in-node, PP2 across two nodes on H200 | v0: correct on H20 and H200 (1, 8, 2 x 8 GPUs), SOL analysis, not in an engine yet; see its README |
+| `tp8moe/` | Kimi K3 Stable LatentMoE (896 experts, top-16, latent 3584), TP8 in-node, PP2 across two nodes on H200 | v0: correct on H20 and H200 (1, 8, 2 x 8 GPUs), SOL analysis, not in an engine yet; see its README |
 
-`k3_tp8moe/k3tp8moe.cu` is the tp4moe2 kernel generalized to the K3 shapes and includes the pipeline headers from `serving_tp4moe2_v26/`.
+`tp8moe/tp8moe.cu` is the tp4moe2 kernel generalized to the K3 shapes and includes the pipeline headers from `serving_tp4moe2_v26/`.
 
 ## serving_tp4moe2_v26: TP4 fused MoE decode kernel for H20
 

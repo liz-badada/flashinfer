@@ -1,6 +1,6 @@
 """Industry MoE kernels on the K3 TP8 per-rank shard (E = 896 experts, K = 3584 latent, per-rank intermediate N = 384, top-16, SiTU),
 one H200, CUDA graph of --copies back-to-back calls, us per call (min / median over --reps replays).  Routing: uniform random top-16 of
-896 (seeded per M) like test_k3, so the unique-expert count (the bytes) matches our kernel's runs.  Each baseline runs in its own try
+896 (seeded per M) like test_tp8moe, so the unique-expert count (the bytes) matches our kernel's runs.  Each baseline runs in its own try
 block; a failing one is reported and skipped.  All are expert-only on one GPU: add nccl_ar.py's 8-GPU all-reduce to compare with our
 TP8 figure, or compare with our ndev-1 figure.
   marlin_mxfp4_w4a16 : SGLang marlin runner for MXFP4 checkpoints on Hopper (prepare_moe_mxfp4_layer_for_marlin + fused_marlin_moe,
@@ -19,10 +19,10 @@ dev = torch.device('cuda')
 
 
 def routing(M, seed):
-    """Exactly test_k3's routing (K3 sigmoid gate on seeded random logits, seed 100 + M): same ids, same unique-expert count as our runs."""
+    """Exactly test_tp8moe's routing (K3 sigmoid gate on seeded random logits, seed 100 + M): same ids, same unique-expert count as our runs."""
     import os, sys
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
-    from test_k3 import random_routing
+    from test_tp8moe import random_routing
     ids, w = random_routing(M, E, dev, seed)
     return ids.to(torch.int32).contiguous(), w.float().contiguous(), int(ids.unique().numel())
 

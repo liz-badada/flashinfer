@@ -1,12 +1,12 @@
-"""Two-node layout driver for K3 MoE layers: TP8 inside each node (k3tp8moe + k3_layer glue), PP2 across the nodes.
+"""Two-node layout driver for K3 MoE layers: TP8 inside each node (tp8moe + moe_layer glue), PP2 across the nodes.
 
 Stage s (node s) holds layers [s * L, (s + 1) * L); the hidden states (BF16 [M, 7168]) move stage 0 -> stage 1 with
 torch.distributed send / recv (NCCL; across nodes that is the IB / EFA link, inside one node NVLink).  Each stage's 8 ranks form a TP
 group with its own IPC-linked one-shot LL buffers.  World = 16 ranks: rank r is stage r // 8, TP rank r % 8, device r % 8 (so the whole
 two-node layout can be rehearsed on ONE 8-GPU node with two ranks per GPU: --colocated).
 
-  python k3_pp2.py --layers 2 --ms 1 8 --nexp 32 --colocated          # 16 ranks on 8 GPUs: pipeline output == all layers on one TP8 group
-  torchrun --nnodes 2 --nproc_per_node 8 ... k3_pp2.py --layers 46 ... # the real two-node run (not exercised here: no second node)
+  python pp2.py --layers 2 --ms 1 8 --nexp 32 --colocated          # 16 ranks on 8 GPUs: pipeline output == all layers on one TP8 group
+  torchrun --nnodes 2 --nproc_per_node 8 ... pp2.py --layers 46 ... # the real two-node run (not exercised here: no second node)
 """
 import argparse
 import os
@@ -21,11 +21,11 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import k3_host as H   # noqa: E402
-import k3_synth as S   # noqa: E402
-from k3_layer import K3MoELayerTP8, HID, NDEV   # noqa: E402
-from test_k3 import CudaRT, stats   # noqa: E402
-from test_k3_layer import dense_weights   # noqa: E402
+import tp8moe_host as H   # noqa: E402
+import mx_synth as S   # noqa: E402
+from moe_layer import MoELayerTP8, HID, NDEV   # noqa: E402
+from test_tp8moe import CudaRT, stats   # noqa: E402
+from test_layer import dense_weights   # noqa: E402
 
 NSTAGE = 2
 
@@ -35,7 +35,7 @@ def make_layers(stage, tp_rank, st, dev, L, nexp, group):
     for li in range(stage * L, (stage + 1) * L):   # deterministic per (layer, tp_rank): both stages can rebuild each other's layers
         experts = S.make_expert_weights(nexp, dev, seed=1000 * li + tp_rank)
         D = dense_weights(dev, seed=77 + li)
-        layers.append(K3MoELayerTP8(tp_rank, st, experts, group=group, **D))
+        layers.append(MoELayerTP8(tp_rank, st, experts, group=group, **D))
     return layers
 
 
@@ -146,7 +146,7 @@ def main():
         args.rdv = None
         worker(int(os.environ['RANK']), args)
     else:
-        args.rdv = tempfile.mktemp(prefix='k3pp_rdv_')
+        args.rdv = tempfile.mktemp(prefix='tp8moe_rdv_')
         mp.spawn(worker, args=(args,), nprocs=NSTAGE * NDEV, join=True)
 
 

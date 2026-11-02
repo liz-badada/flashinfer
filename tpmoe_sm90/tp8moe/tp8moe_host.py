@@ -1,7 +1,7 @@
-"""Host side of k3tp8moe.cu: extension loader, per-rank workspace (+ one-shot LL all-reduce buffers), launch wrapper.
+"""Host side of tp8moe.cu: extension loader, per-rank workspace (+ one-shot LL all-reduce buffers), launch wrapper.
 
 run(): latent input z (BF16 [M, 3584], quantized in-kernel per token), routing ids / weights [M, 16] (K3 sigmoid gate, computed
-outside), expert weights in the kernel layout (k3_synth) -> BF16 [M, 3584] = this rank's routed sum (ndev 1) or the 8-rank sum (ndev 8).
+outside), expert weights in the kernel layout (mx_synth) -> BF16 [M, 3584] = this rank's routed sum (ndev 1) or the 8-rank sum (ndev 8).
 """
 import os
 
@@ -16,19 +16,19 @@ _ext = None
 def ext(flags=(), name=None):
     global _ext
     if _ext is None:
-        flags = tuple(flags) + tuple(os.environ.get('K3_FLAGS', '').split())
+        flags = tuple(flags) + tuple(os.environ.get('TP8MOE_FLAGS', '').split())
         tag = ''.join(c if c.isalnum() else '_' for c in ''.join(flags))
-        if os.environ.get('K3_SKIP_CUDA_CHECK') == '1':  # container with nvcc major != torch's cuda major
+        if os.environ.get('TP8MOE_SKIP_CUDA_CHECK') == '1':  # container with nvcc major != torch's cuda major
             import torch.utils.cpp_extension as _ce
             _ce._check_cuda_version = lambda *a, **k: None
         saved = os.environ.get('TORCH_CUDA_ARCH_LIST')
         os.environ['TORCH_CUDA_ARCH_LIST'] = '9.0a'
-        build = os.path.join(HERE, 'build', name or ('k3tp8moe' + tag))
+        build = os.path.join(HERE, 'build', name or ('tp8moe' + tag))
         os.makedirs(build, exist_ok=True)
         try:
-            _ext = load(name=name or ('k3tp8moe' + tag), sources=[os.path.join(HERE, 'k3tp8moe.cu')], build_directory=build,
+            _ext = load(name=name or ('tp8moe' + tag), sources=[os.path.join(HERE, 'tp8moe.cu')], build_directory=build,
                         extra_cuda_cflags=['-O3', '-gencode=arch=compute_90a,code=sm_90a', f'-I{HERE}', f'-I{TP4_DIR}', '-DCCCL_DISABLE_CTK_COMPATIBILITY_CHECK'] + list(flags),
-                        verbose=os.environ.get('K3_BUILD_VERBOSE') == '1')
+                        verbose=os.environ.get('TP8MOE_BUILD_VERBOSE') == '1')
         finally:
             if saved is None:
                 os.environ.pop('TORCH_CUDA_ARCH_LIST', None)

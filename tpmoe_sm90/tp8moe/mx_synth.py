@@ -1,4 +1,4 @@
-"""Synthetic Kimi K3 expert weights for k3tp8moe: the kernel's Humming fused-E8M0 MXFP4 layout (generalized from humming_synth.py to
+"""Synthetic Kimi K3 expert weights for tp8moe: the kernel's Humming fused-E8M0 MXFP4 layout (generalized from humming_synth.py to
 DIM = 3584 latent / INTER = 384 per-rank intermediate), the K3 checkpoint format (compressed-tensors mxfp4-pack: weight_packed uint8 [N, K/2],
 weight_scale E8M0 uint8 [N, K/32]) and the conversion checkpoint -> kernel layout.
 

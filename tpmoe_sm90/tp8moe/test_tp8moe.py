@@ -1,7 +1,7 @@
-"""k3tp8moe checks on synthetic K3 weights.
+"""tp8moe checks on synthetic K3 weights.
 
-  python test_k3.py --local --ms 1 2 4 8 16 32 [--nexp 128]      # one GPU: kernel (ndev 1) vs the torch reference
-  python test_k3.py --tp8 --ms 1 8 32 [--nexp 128] [--b2b]       # 8 GPUs: one-shot LL all-reduce, every rank vs the 8-rank reference
+  python test_tp8moe.py --local --ms 1 2 4 8 16 32 [--nexp 128]      # one GPU: kernel (ndev 1) vs the torch reference
+  python test_tp8moe.py --tp8 --ms 1 8 32 [--nexp 128] [--b2b]       # 8 GPUs: one-shot LL all-reduce, every rank vs the 8-rank reference
 """
 import argparse
 import ctypes
@@ -14,9 +14,9 @@ from pathlib import Path
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import k3_host as H   # noqa: E402
-import k3_ref as R   # noqa: E402
-import k3_synth as S   # noqa: E402
+import tp8moe_host as H   # noqa: E402
+import moe_ref as R   # noqa: E402
+import mx_synth as S   # noqa: E402
 
 
 def random_routing(M, n_exp, device, seed, topk=16):
@@ -209,7 +209,7 @@ def main():
         local(args)
     if args.tp8:
         import torch.multiprocessing as mp
-        args.rdv = tempfile.mktemp(prefix='k3_rdv_')
+        args.rdv = tempfile.mktemp(prefix='tp8moe_rdv_')
         mp.spawn(worker, args=(args,), nprocs=8, join=True)
 
 
