@@ -38,25 +38,23 @@ scalings exist in the checkpoint (attn_res_block_size 12) and are outside this b
   `ITEMS` = INTER/128 = 3 FC1 items per panel, 28 FC1 k-tiles, 3 FC2 k-tiles, 14 row tiles. Stream-K cost / index math uses
   `ITEMS` / `NKT1` instead of 4 / 32; panel info packs e in 10 bits; FC2 unit words pack pid at bit 20; `km` slot masks are 16-bit.
 - Tables: the block-wide builder scans 896 experts with 512 threads in two rounds; `MAXP` 512 panels -> host requires M * topk <= 512
-  (M <= 32). Small tables (M <= 8) use the bitmap builder. Dense mode and the fused sqrt-softplus gate are disabled (DeepSeek-specific).
+  (M <= 32). Small tables (M <= 8) use the bitmap builder.
 - Epilogue: SiTU-GLU instead of the clamped SwiGLU (`situ_glu`, fp32, result BF16).
-- Tail: 8-way one-shot only (every rank pushes to all 8, each reduces in rank order, fp32, one BF16 rounding), parity double-buffered;
-  RS + AG mode is not adapted (14 row tiles do not split evenly over 8 ranks).
+- Tail: 8-way one-shot only (every rank pushes to all 8, each reduces in rank order, fp32, one BF16 rounding), parity double-buffered.
 - Fused per-token quantization bounded to DIM / 8 chunks (the 4096 assumption overran rows: a race at M >= 4).
-- Shared expert is not fused (`TP2_SHARED 0`): K3's is full-width (7168), it belongs to the second reduce stage.
-- ptxas: 96 registers (640-thread launch bound), 168 B spill stores / 80 B loads (the 16-slot T1 combine; tp4moe2 had none).
+- Removed from the tp4moe2 source: the fused sqrt-softplus top-6 router and router GEMM (K3 routes with a sigmoid gate, computed outside),
+  the fused FP8 shared expert (K3's is full-width 7168 and belongs to the second reduce stage), the RS + AG tail (14 row tiles do not
+  split over 8 ranks), the CTA-local dense quantization (hard-coded to 4096-wide rows) and the timing-diagnostic knobs. Dense mode
+  (`TP2_DENSE_MAXM`, default off) is kept but untuned for 896 experts.
+- ptxas: 96 registers (640-thread launch bound), 80 B stack frame (the 16-slot T1 combine spills; tp4moe2 had none).
 
-**Shared with `serving_tp4moe2_v26/`, and why the kernel is a separate file.** The k-loop pipeline headers (`kpipe.cuh`, `chain4.cuh`,
-`chain_ss.cuh`, `shared_num.cuh`) are the tp4moe2 files, included from `../serving_tp4moe2_v26` (`tp8moe_host.py` adds the `-I`; the cubin
-built that way is byte-identical to the one built from copies). `tp8moe.cu` is `tp4moe2_ns.cu` generalized: 423 changed lines in
-125 hunks, almost all of them the hard-coded 4 / 32 / 16 / 256 / 8 / 4 becoming `ITEMS` / `NKT1` / `NRT` / `NEXP` / `TOPK_MAX` /
-`NDEV`, wider bit fields (expert 8 -> 10 bits, pid at bit 20, 16-bit slot masks) and the K3-only pieces listed above (multi-round
-896-expert table scan, SiTU-GLU, one-shot-only tail, no dense / fused-gate / fused-shared paths). It is not folded into the tp4moe2
-sources because that package is frozen (`sources.json` pins every file by SHA-256 and the serving hook refuses to load otherwise) and
-the wider bit fields change the DeepSeek kernel's table layout and register allocation, i.e. the validated binary. The intended end
-state is one kernel body parameterized by a model config (DIM / INTER / NEXP / TOPK / NDEV / activation) with tp4moe2 re-frozen as v27
-after an H20 re-validation; until then the two `.cu` files sit side by side on this branch and a change to the shared logic has to be
-applied to both.
+**Shared with `serving_tp4moe2_v26/`, and why the kernel is a separate file.** The k-loop pipeline headers (`kpipe.cuh`, `chain4.cuh`)
+are the tp4moe2 files, included from `../serving_tp4moe2_v26` (`tp8moe_host.py` adds the `-I`). `tp8moe.cu` is `tp4moe2_ns.cu`
+generalized (`ITEMS` / `NKT1` / `NRT` / `NEXP` / `TOPK_MAX` / `NDEV` instead of the hard-coded 4 / 32 / 16 / 256 / 8 / 4, wider bit
+fields: expert 10 bits, pid at bit 20, 16-bit slot masks) plus the K3-only pieces above. It is not folded into the tp4moe2 sources
+because that package is frozen (`sources.json` pins every file by SHA-256) and the wider bit fields change the validated binary. The
+intended end state is one kernel body parameterized by a model config (DIM / INTER / NEXP / TOPK / NDEV / activation) with tp4moe2
+re-frozen as v27 after an H20 re-validation; until then a change to the shared logic has to be applied to both files.
 
 Weights: `mx_synth.py` packs the kernel layout (generalized Humming fused-E8M0 blocks) and converts the **K3 checkpoint format**
 (`mxfp4-pack-quantized`: E2M1 nibbles, low nibble = even k, E8M0 scales) exactly (per-expert factor f = 2^(e_max - 12), groups more than
@@ -253,10 +251,10 @@ docker `br-*` bridges that NCCL does not exclude by default, so without `NCCL_SO
 ## Two-node layout: `pp2.py` (TP8 x PP2)
 
 Stage s holds layers [s L, (s + 1) L) on its own TP8 group (own IPC-linked LL buffers, NCCL group); the BF16 hidden states hop
-stage 0 -> 1 with `send` / `recv` (NCCL over the inter-node link in the real run). Rehearsed on one 8-GPU node with 16 ranks (two
-per GPU, `--colocated`: the world group is gloo and the hop goes through host memory, since NCCL refuses two ranks on one GPU):
-the pipeline output is **bitwise equal** to all layers run on a single TP8 group (M = 1, 8; 2 x 2 layers). The real two-node run (`torchrun --nnodes 2 --nproc_per_node 8 ... pp2.py`, env:// rendezvous, device = LOCAL_RANK) was executed on
-2 x 8 H200 on computelab: bitwise equal at M = 1, 8, 32 (see the H200 section).
+stage 0 -> 1 with `send` / `recv`. Real run: `torchrun --nnodes 2 --nproc_per_node 8 ... pp2.py` (env:// rendezvous, device =
+LOCAL_RANK; results in the H200 section). Rehearsal on one 8-GPU node: `--colocated` runs 16 ranks, two per GPU (the world group is
+gloo and the hop goes through host memory, since NCCL refuses two ranks on one GPU); the pipeline output is bitwise equal to all
+layers run on a single TP8 group.
 
 ## Run
 

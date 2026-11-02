@@ -9,7 +9,7 @@ import torch
 from torch.utils.cpp_extension import load
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-TP4_DIR = os.path.join(os.path.dirname(HERE), 'serving_tp4moe2_v26')   # kpipe.cuh / chain4.cuh / chain_ss.cuh / shared_num.cuh are shared with tp4moe2 (identical files)
+TP4_DIR = os.path.join(os.path.dirname(HERE), 'serving_tp4moe2_v26')   # kpipe.cuh / chain4.cuh: the k-loop pipeline headers shared with tp4moe2
 _ext = None
 
 
@@ -48,7 +48,6 @@ class RankState:
         self.act = torch.zeros(E.MAXE * E.INTER, dtype=torch.bfloat16, **z)
         self.amax = torch.zeros(E.MAXE * 4, dtype=torch.float32, **z)
         self.part = torch.zeros(2 * grid * E.NCONS * 32, dtype=torch.float32, **z)
-        self.act_flags = torch.zeros(E.MAXP * 4, dtype=torch.int32, **z)
         self.part_flags = torch.zeros(max(2 * grid, 256), dtype=torch.int32, **z)
         self.rt_cnt = torch.zeros(2 * E.NRT, dtype=torch.int32, **z)
         self.work = torch.zeros(4, dtype=torch.int32, **z)
@@ -60,11 +59,11 @@ class RankState:
         self.xg = torch.zeros((E.MAXE + 8 * E.MAXP) * E.DIM, dtype=torch.uint8, **z)
         self.xg_cnt = torch.zeros(2 * E.MAXP, dtype=torch.int32, **z)
         self.fc2_next = torch.zeros(4, dtype=torch.int32, **z)
-        self.xqw = torch.zeros(max(E.MAXM, grid * 16) * E.DIM, dtype=torch.uint8, **z)   # fused input quantization workspace
+        self.xqw = torch.zeros(E.MAXM * E.DIM, dtype=torch.uint8, **z)   # fused input quantization workspace (e4m3 x, scales, flags)
         self.xsw = torch.zeros(E.MAXM, dtype=torch.float32, **z)
         self.xflag = torch.zeros(E.MAXM, dtype=torch.int32, **z)
         self.seq = 0
-        self.rs_ptrs, self.ag_ptrs = [], []
+        self.rs_ptrs = []
         if alloc_comm:
             self.rs_buf = torch.zeros(self.RS_BYTES() // 4, dtype=torch.int32, **z)
 
@@ -73,19 +72,9 @@ class RankState:
         E = ext()
         return 2 * E.NDEV * E.NRT * E.OS_MAXM * E.NMSG * 16
 
-    @staticmethod
-    def AG_BYTES():   # (RS + AG mode is not used: nothing to allocate)
-        return 0
-
-    def link_ptrs(self, rs_ptrs, ag_ptrs=()):
+    def link_ptrs(self, rs_ptrs):
+        """rs_ptrs[d]: device pointer of rank d's one-shot buffer (own or IPC-mapped), RS_BYTES each."""
         self.rs_ptrs = [int(p) for p in rs_ptrs]
-        self.ag_ptrs = [int(p) for p in ag_ptrs]
-
-    @staticmethod
-    def link(states):
-        rs = [s.rs_buf.data_ptr() for s in states]
-        for s in states:
-            s.link_ptrs(rs)
 
 
 _EMPTY = {}
@@ -99,16 +88,14 @@ def _empty(device, dtype):
 
 
 def run(state, w, zb, ids, rw, out, my_rank, ndev, dbg=None, tl=None, factor=1.0):
-    """zb: BF16 latent input [M, 3584] (quantized in-kernel, per token e4m3); ids int32 / rw fp32 [M, topk <= 16]; out BF16 [M, 3584]."""
+    """zb: BF16 latent input [M, 3584] (quantized in-kernel, per token e4m3); ids int32 / rw fp32 [M, topk <= 16]; out BF16 [M, 3584].
+    dbg / tl: TP2_STAMPS builds only (per-CTA globaltimer stamps / FC2 unit timeline, int64 tensors)."""
     state.seq += 1
-    dev = out.device
     E = ext()
-    e_i32, e_f32, e_bf, e_u8, e_i64 = _empty(dev, torch.int32), _empty(dev, torch.float32), _empty(dev, torch.bfloat16), _empty(dev, torch.uint8), _empty(dev, torch.int64)
-    E.run(state.xqw, state.xsw, w['w1'], w['s1'], w['f1'], w['w2'], w['s2'], w['f2'], ids, rw, e_bf, float(factor),
-          state.act, state.amax, state.part, state.act_flags, state.part_flags, state.rt_cnt, state.work, state.outp,
+    e_i64 = _empty(out.device, torch.int64)
+    E.run(state.xqw, state.xsw, w['w1'], w['s1'], w['f1'], w['w2'], w['s2'], w['f2'], ids, rw, float(factor),
+          state.act, state.amax, state.part, state.part_flags, state.rt_cnt, state.work, state.outp,
           state.hq, state.hs, state.h_flags, state.pan_cnt, state.xg, state.xg_cnt, state.fc2_next,
-          state.rs_ptrs if ndev > 1 else [], state.ag_ptrs if ndev > 1 else [], out, my_rank, ndev,
+          state.rs_ptrs if ndev > 1 else [], out, my_rank, ndev,
           dbg if dbg is not None else e_i64, tl if tl is not None else e_i64,
-          zb, state.xflag, state.seq,
-          e_f32, e_f32, e_bf, e_i32,
-          e_u8, e_f32, e_u8, e_f32, e_u8, e_f32, e_f32, e_bf)
+          zb, state.xflag, state.seq)

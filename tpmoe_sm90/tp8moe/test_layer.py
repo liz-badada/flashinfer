@@ -18,7 +18,7 @@ import tp8moe_host as H   # noqa: E402
 import moe_ref as R   # noqa: E402
 import mx_synth as S   # noqa: E402
 from moe_layer import MoELayerTP8, HID, LAT, SH_INTER, NDEV   # noqa: E402
-from test_tp8moe import CudaRT, stats   # noqa: E402
+from test_tp8moe import ipc_link, stats, capture_graph, replay_times   # noqa: E402
 
 
 def dense_weights(device, seed=7):
@@ -33,14 +33,8 @@ def worker(rank, args):
     torch.cuda.set_device(rank)
     dev = torch.device('cuda', rank)
     dist.init_process_group('nccl', init_method='file://' + args.rdv, world_size=NDEV, rank=rank)
-    H.ext()
     st = H.RankState(dev, alloc_comm=False)
-    rt = CudaRT(); rt.ck(rt.lib.cudaSetDevice(rank))
-    ptr = rt.malloc(H.RankState.RS_BYTES())
-    raw = [None] * NDEV
-    dist.all_gather_object(raw, rt.handle(ptr))
-    st.link_ptrs([ptr if peer == rank else rt.open(h) for peer, h in enumerate(raw)])
-    torch.cuda.synchronize(); dist.barrier()
+    ipc_link(st, rank, rank)
     experts = S.make_expert_weights(args.nexp, dev, seed=1 + rank, keep_dq=True)   # this rank's intermediate shard of every expert
     D = dense_weights(dev)
     layer = MoELayerTP8(rank, st, experts, **D)
@@ -82,20 +76,8 @@ def worker(rank, args):
             # the same layer captured in one CUDA graph (NCCL collectives included): per-call time of a graph of --copies calls
             n = args.copies
             xs = [torch.randn(M, HID).to(torch.bfloat16).to(dev) for _ in range(n)]
-            for xx in xs: layer.forward(xx)
-            torch.cuda.synchronize(); dist.barrier()
-            gph = torch.cuda.CUDAGraph(); sstream = torch.cuda.Stream()
-            sstream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(sstream):
-                with torch.cuda.graph(gph, stream=sstream):
-                    ys = [layer.forward(xx) for xx in xs]
-            torch.cuda.synchronize(); dist.barrier()
-            tsg = []
-            for rep in range(args.reps):
-                dist.barrier()
-                e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-                e0.record(); gph.replay(); e1.record(); torch.cuda.synchronize()
-                tsg.append(e0.elapsed_time(e1) * 1e3 / n)
+            gph = capture_graph(lambda i: layer.forward(xs[i]), n, dist.barrier)
+            tsg = replay_times(gph, n, args.reps, dist.barrier)
             allt = [None] * NDEV
             dist.all_gather_object(allt, (min(tsg), sorted(tsg)[len(tsg) // 2]))
             if rank == 0:

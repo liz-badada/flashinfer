@@ -14,7 +14,7 @@ import torch.distributed as dist
 import tp8moe_host as H
 import moe_ref as R
 
-HID, LAT, SH_INTER, NEXP, TOPK, NDEV = 7168, 3584, 6144, 896, 16, 8
+HID, LAT, SH_INTER, TOPK, NDEV = 7168, 3584, 6144, 16, 8
 
 
 class MoELayerTP8:

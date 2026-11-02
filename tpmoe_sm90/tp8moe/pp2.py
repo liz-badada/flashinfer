@@ -6,7 +6,7 @@ group with its own IPC-linked one-shot LL buffers.  World = 16 ranks: rank r is 
 two-node layout can be rehearsed on ONE 8-GPU node with two ranks per GPU: --colocated).
 
   python pp2.py --layers 2 --ms 1 8 --nexp 32 --colocated          # 16 ranks on 8 GPUs: pipeline output == all layers on one TP8 group
-  torchrun --nnodes 2 --nproc_per_node 8 ... pp2.py --layers 46 ... # the real two-node run (not exercised here: no second node)
+  torchrun --nnodes 2 --nproc_per_node 8 ... pp2.py --layers 46 ... # the real two-node run (env:// rendezvous, device = LOCAL_RANK)
 """
 import argparse
 import os
@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import tp8moe_host as H   # noqa: E402
 import mx_synth as S   # noqa: E402
 from moe_layer import MoELayerTP8, HID, NDEV   # noqa: E402
-from test_tp8moe import CudaRT, stats   # noqa: E402
+from test_tp8moe import ipc_link, stats   # noqa: E402
 from test_layer import dense_weights   # noqa: E402
 
 NSTAGE = 2
@@ -59,12 +59,7 @@ def worker(rank, args):
     group = groups[stage]
     H.ext()
     st = H.RankState(dev, alloc_comm=False)
-    rt = CudaRT(); rt.ck(rt.lib.cudaSetDevice(dev_id))
-    ptr = rt.malloc(H.RankState.RS_BYTES())
-    raw = [None] * NDEV
-    dist.all_gather_object(raw, rt.handle(ptr), group=group)   # IPC link inside the TP group only
-    st.link_ptrs([ptr if peer == tp_rank else rt.open(h) for peer, h in enumerate(raw)])
-    torch.cuda.synchronize(); dist.barrier()
+    ipc_link(st, dev_id, tp_rank, group=group)   # IPC link inside the TP group only
     layers = make_layers(stage, tp_rank, st, dev, args.layers, args.nexp, group)
     peer = rank + NDEV if stage == 0 else rank - NDEV   # same TP rank on the other stage
 

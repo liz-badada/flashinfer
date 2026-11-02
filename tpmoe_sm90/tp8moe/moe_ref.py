@@ -1,8 +1,7 @@
 """Torch reference of tp8moe's numerics (one rank's routed experts in the latent space, TP combine) and of the whole K3 MoE block."""
 import torch
 
-DIM, INTER, NEXP, TOPK = 3584, 384, 896, 16
-HIDDEN = 7168
+DIM, INTER, TOPK = 3584, 384, 16
 INV448 = 0.0022321429569274187
 SITU_B1, SITU_B2 = 4.0, 25.0
 
