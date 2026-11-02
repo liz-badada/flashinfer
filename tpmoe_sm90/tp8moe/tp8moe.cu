@@ -103,7 +103,10 @@ constexpr int k_cost0 = TP2_APPLY(TP2_A0, TP2_COST), k_cost1 = TP2_APPLY(TP2_A1,
 #define TP2_EPI_COST 250, 300, 400, 500                // owner epilogue cost of one FC1 item by width class (same units: 100 = one N8 k-tile)
 #endif
 #ifndef TP2_EPI_SCALE
-#define TP2_EPI_SCALE 300   // percent; compact panels only (dense mode: 0)
+#define TP2_EPI_SCALE 300   // percent; compact panels (dense mode: TP2_EPI_SCALE_DENSE)
+#endif
+#ifndef TP2_EPI_SCALE_DENSE
+#define TP2_EPI_SCALE_DENSE 0   // percent: owner epilogue cost credited in the dense stream-K cost model (100 / 200 measured -0.2 / 0.0 us at M = 1)
 #endif
 constexpr int k_epi0 = TP2_APPLY(TP2_A0, TP2_EPI_COST), k_epi1 = TP2_APPLY(TP2_A1, TP2_EPI_COST), k_epi2 = TP2_APPLY(TP2_A2, TP2_EPI_COST), k_epi3 = TP2_APPLY(TP2_A3, TP2_EPI_COST);
 __device__ __forceinline__ uint32_t sel4(int cl, int a, int b, int c, int d) { return (uint32_t)(cl == 0 ? a : (cl == 1 ? b : (cl == 2 ? c : d))); }   // immediates, no constant-bank load
@@ -111,7 +114,8 @@ __device__ __forceinline__ uint32_t c_cost(int cl) { return sel4(cl, k_cost0, k_
 // stream-K cost of one panel of width class cl: ITEMS items x (owner epilogue + NKT1 k-tiles); a position x (cost units from the
 // panel start) maps to the item-major k-tile whose range it falls in (the epilogue cost sits before an item's k-tile 0: its owner pays it)
 __device__ __forceinline__ uint32_t c_epi(int cl, bool dense) {
-    return dense ? 0u : sel4(cl, k_epi0 * TP2_EPI_SCALE / 100, k_epi1 * TP2_EPI_SCALE / 100, k_epi2 * TP2_EPI_SCALE / 100, k_epi3 * TP2_EPI_SCALE / 100);
+    return dense ? sel4(cl, k_epi0 * TP2_EPI_SCALE_DENSE / 100, k_epi1 * TP2_EPI_SCALE_DENSE / 100, k_epi2 * TP2_EPI_SCALE_DENSE / 100, k_epi3 * TP2_EPI_SCALE_DENSE / 100)
+                 : sel4(cl, k_epi0 * TP2_EPI_SCALE / 100, k_epi1 * TP2_EPI_SCALE / 100, k_epi2 * TP2_EPI_SCALE / 100, k_epi3 * TP2_EPI_SCALE / 100);
 }
 __device__ __forceinline__ uint32_t panel_cost(int cl, bool dense) { return (uint32_t)ITEMS * (c_epi(cl, dense) + (uint32_t)NKT1 * c_cost(cl)); }
 __device__ __forceinline__ int panel_kt(uint32_t x, int cl, bool dense) {
@@ -279,6 +283,29 @@ static_assert(512 * TP2_CONS_REGS + 128 * TP2_PROD_REGS <= 61440, "register pool
 #endif
 #ifndef TP2_SMALL_TABLES
 #define TP2_SMALL_TABLES 2   // M * topk <= 128: one-warp table build (2: expert token bitmaps, 1: bitonic sort) instead of the block-wide chain
+#endif
+#ifndef TP2_SMALL_TABLES_BW
+#define TP2_SMALL_TABLES_BW 1   // small tables (M * topk <= 128) built block-wide by warps 0..7 (build_tables_small3) instead of by one warp
+#endif
+#ifndef TP2_TABLES_CHECK
+#define TP2_TABLES_CHECK 0   // diagnostic: build the one-warp tables too and count differing table words into work[3]
+#endif
+#ifndef TP2_DENSE_MAXM
+#define TP2_DENSE_MAXM 8   // M <= this: dense mode (every panel's FC1 B operand = x rows 0..md-1 by TMA straight from xq: no grid-wide x gather / xg_cnt
+                           // round trips; one N8 instantiation at M <= 8 either way).  Env TP2_DENSE_MAXM overrides.  Measured -1.5..-2.5 us at M 1..8.
+#endif
+#ifndef TP2_EARLY_MAP_PF
+#define TP2_EARLY_MAP_PF 1   // producer lane prefetches the 4 weight tensor maps at kernel start (not after the tables)
+#endif
+#ifndef TP2_T1_ONE_GRAB
+#define TP2_T1_ONE_GRAB 1   // T1 queue (TP2_T1_DYN) with <= G items: one grab per CTA (no second grab round trip before the exit).  (Grabbing the
+                            // next item ahead of the current one was measured worse: the first CTAs take two items each and serialize them.)
+#endif
+#ifndef TP2_EARLY_DONE
+#define TP2_EARLY_DONE 1   // the CTA-done atomic is issued before the tail (its return consumed after it) instead of right before the exit
+#endif
+#ifndef TP2_EARLY_EPOCH
+#define TP2_EARLY_EPOCH 1   // the epoch counter is loaded once at kernel start (thread 0 -> smem) instead of by every role after the __syncthreads
 #endif
 #ifndef TP2_FC2_L2PF
 #define TP2_FC2_L2PF 4   // FC2 units per CTA whose weights the TMA lane L2-prefetches right after issuing its last FC1 tile
@@ -729,6 +756,120 @@ __device__ __forceinline__ void build_tables_small2(const Params& P, uint8_t* sm
     STAMP(P, 21);
 }
 
+// Small-M tables, block-wide bitmap form (TP2_SMALL_TABLES_BW): warps 0..7 (256 threads, named barrier 2; warps 8..15 quantize x
+// meanwhile).  Same tables as build_tables_small2, bit for bit.  The one-warp builder scans NEXP / 32 = 28 experts per lane in
+// unrolled loops (~12k cycles at M = 1, mostly cold i-cache misses on ~15 KB of straight-line code); here each thread owns the
+// experts tid + 256 r (4 rounds), the 4 rounds' warp scans are issued together (one barrier for all of them: the scan values are
+// known from the bitmaps), the per-round / per-warp sums are combined by every thread, and there is no 28-way unrolled loop.
+// (pres, count, padded rows) travel packed in one scan word: the totals are bounded by the entries (U, E_tot <= MT <= 128: 8 bits each;
+// padded rows <= E_tot + 7 U <= 1024: 11 bits).
+__device__ __forceinline__ void build_tables_small3(const Params& P, uint8_t* smem, const Tabs& T) {
+    constexpr int BT = 256, NR = (NEXP + BT - 1) / BT;   // 4 rounds of 256 experts
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int M = P.M, topk = P.topk, MT = M * topk;
+    uint32_t* tm = reinterpret_cast<uint32_t*>(smem + PRO_BITS);     // [NEXP] token mask per expert
+    int* eoff = reinterpret_cast<int*>(smem + PRO_OFFE);              // [NEXP] entry offset of expert (valid if present)
+    int* eslot = reinterpret_cast<int*>(smem + PRO_PIDE);             // [NEXP] union slot (= panel) of expert
+    int* ws = reinterpret_cast<int*>(smem + PRO_CNT);                  // [NR][2][8] warp sums: packed (pres, count, padded rows), cost
+    const int e_id = tid < MT ? __ldcg(P.ids + tid) : -1;            // routing entry tid (MT <= 128 < BT)
+    const int t = tid / topk, k = tid - t * topk;
+    for (int e = tid; e < NEXP; e += BT) tm[e] = 0u;
+    for (int i = tid; i < M * TOPK_MAX; i += BT) if ((i & (TOPK_MAX - 1)) >= topk) T.ids[i] = (uint16_t)0xFFFF;   // row padding
+    for (int i = tid; i < (MT + 1) / 2; i += BT) reinterpret_cast<unsigned*>(T.km)[i] = 0u;
+    const bool ok = tid < MT && (unsigned)e_id < (unsigned)P.n_exp;
+    if (tid < MT) T.ids[t * TOPK_MAX + k] = ok ? (uint16_t)e_id : (uint16_t)0xFFFF;
+    named_bar_sync(2, BT);
+    if (ok) atomicOr(tm + e_id, 1u << t);
+    named_bar_sync(2, BT);
+    STAMP(P, 17);
+    const uint32_t dpc = P.dense ? panel_cost((P.md + 7) / 8 - 1, true) : 0u;   // dense: every panel costs the same
+    uint32_t mk[NR], a[NR], c[NR], ai[NR], ci[NR];
+#pragma unroll
+    for (int r = 0; r < NR; ++r) {
+        const int e = tid + r * BT;
+        mk[r] = e < NEXP ? tm[e] : 0u;
+        const int n = __popc(mk[r]);
+        a[r] = n ? (1u | ((uint32_t)n << 8) | ((uint32_t)((n + 7) & ~7) << 16)) : 0u;
+        c[r] = n ? (P.dense ? dpc : panel_cost((n + 7) / 8 - 1, false)) : 0u;
+        ai[r] = a[r]; ci[r] = c[r];
+    }
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1) {   // inclusive warp scans, all rounds interleaved
+#pragma unroll
+        for (int r = 0; r < NR; ++r) {
+            const uint32_t ya = __shfl_up_sync(0xffffffffu, ai[r], o), yc = __shfl_up_sync(0xffffffffu, ci[r], o);
+            if (lane >= o) { ai[r] += ya; ci[r] += yc; }
+        }
+    }
+    if (lane == 31) {
+#pragma unroll
+        for (int r = 0; r < NR; ++r) { ws[(r * 2) * 8 + warp] = (int)ai[r]; ws[(r * 2 + 1) * 8 + warp] = (int)ci[r]; }
+    }
+    named_bar_sync(2, BT);
+    // exclusive bases (rounds before r, all warps + round r's warps before this one) and the totals: every warp scans the 32
+    // (round, warp) sums itself, lane = round * 8 + warp (no second barrier, no serial loop)
+    uint32_t xa[NR], xc[NR];
+    uint32_t tot_a, tot_c;
+    {
+        static_assert(NR * (BT / 32) == 32, "one (round, warp) sum per lane");
+        uint32_t sa = (uint32_t)ws[(lane >> 3) * 16 + (lane & 7)], sc = (uint32_t)ws[(lane >> 3) * 16 + 8 + (lane & 7)];
+        const uint32_t oa = sa, oc = sc;
+#pragma unroll
+        for (int o = 1; o < 32; o <<= 1) {
+            const uint32_t ya = __shfl_up_sync(0xffffffffu, sa, o), yc = __shfl_up_sync(0xffffffffu, sc, o);
+            if (lane >= o) { sa += ya; sc += yc; }
+        }
+        tot_a = __shfl_sync(0xffffffffu, sa, 31); tot_c = __shfl_sync(0xffffffffu, sc, 31);
+        const uint32_t ea = sa - oa, ec = sc - oc;
+#pragma unroll
+        for (int r = 0; r < NR; ++r) { xa[r] = __shfl_sync(0xffffffffu, ea, r * 8 + warp); xc[r] = __shfl_sync(0xffffffffu, ec, r * 8 + warp); }
+    }
+    const int U = (int)(tot_a & 255u), E_tot = (int)((tot_a >> 8) & 255u);
+    const uint32_t nn_tot = tot_a >> 16;
+#pragma unroll
+    for (int r = 0; r < NR; ++r) {
+        const int n = __popc(mk[r]);
+        if (!n) continue;
+        const int e = tid + r * BT;
+        const uint32_t xe = xa[r] + ai[r] - a[r];   // exclusive packed prefix
+        const int u = (int)(xe & 255u), E = (int)((xe >> 8) & 255u);
+        T.uexp[u] = (uint16_t)e; T.off[u] = (uint16_t)E; T.pid[u] = (uint16_t)u; T.p2u[u] = (uint16_t)u;
+        T.pinf[u] = (uint32_t)e | ((uint32_t)n << 10) | ((uint32_t)E << 16);
+        T.ccum[u] = xc[r] + ci[r] - c[r]; T.prow[u] = xe >> 16;
+        eoff[e] = E; eslot[e] = u;
+    }
+    if (tid == 0) {
+        T.off[U] = (uint16_t)E_tot; T.pid[U] = (uint16_t)U; T.misc[0] = U; T.misc[1] = E_tot; T.misc[2] = U; T.misc[4] = U;
+        T.ccum[U] = tot_c; T.prow[U] = nn_tot;
+    }
+    named_bar_sync(2, BT);
+    STAMP(P, 20);
+    if (ok) {   // entries (rank of the token in its expert's mask) and slot masks: a duplicate expert in several slots of a token is one entry
+        const int ent = eoff[e_id] + __popc(tm[e_id] & ((1u << t) - 1u));
+        T.ent[ent] = (uint16_t)t; T.e2p[ent] = (uint16_t)eslot[e_id];
+        atomicOr(reinterpret_cast<unsigned*>(T.km + (ent & ~1)), (1u << k) << ((ent & 1) * 16));
+    }
+    {   // stream-K range starts: this CTA's window (as build_tables_small2), one CTA boundary per thread
+        const unsigned G = gridDim.x, b = blockIdx.x + (unsigned)tid;
+        if (tid < 34 && b <= G) {
+            int r;
+            if (P.dense) r = (int)(((unsigned)U * (unsigned)ITEMS * NKT1 * b) / G) & ~(KPS - 1);   // uniform panel cost, no epilogue term
+            else if (b == 0) r = 0;
+            else if (b == G || U == 0) r = U * ITEMS * NKT1;
+            else {
+                const unsigned bcst = (tot_c * b) / G;
+                int lo = 0, hi = U - 1;
+                while (lo < hi) { const int mid = (lo + hi + 1) >> 1; if (T.ccum[mid] <= bcst) lo = mid; else hi = mid - 1; }
+                const int cl = (int)((((T.pinf[lo] >> 10) & 63u) + 7u) / 8u) - 1;
+                r = lo * ITEMS * NKT1 + panel_kt(bcst - T.ccum[lo], cl, false);
+            }
+            T.bnd[b] = r;
+            T.bnd[MAXG + 1 + b] = U * ITEMS * NKT1;
+        }
+    }
+    STAMP(P, 21);
+}
+
 // block-wide tables: the consumer warps only (BT threads, named barrier 1) -- the producer warpgroup quantizes x meanwhile (fused)
 __device__ __forceinline__ void build_tables(const Params& P, uint8_t* smem, const Tabs& T) {
     constexpr int BT = NCONS;
@@ -979,7 +1120,7 @@ __device__ __forceinline__ void producer(const Params& P, uint8_t* smem, uint64_
     // the maps were written by a host copy before this launch: no tensormap-proxy acquire fence needed, just the prefetch
     for (int i = 0; i < 4; ++i) {
         if (TP2_MAP_FENCE) tma_acquire_map(P.tmaps + i);
-        else asm volatile("prefetch.tensormap [%0];" :: "l"(reinterpret_cast<uint64_t>(P.tmaps + i)) : "memory");
+        else if (!TP2_EARLY_MAP_PF) asm volatile("prefetch.tensormap [%0];" :: "l"(reinterpret_cast<uint64_t>(P.tmaps + i)) : "memory");
     }
     // pass A: weights of the first <= NST FC1 stages (no dependency on the x gather / the previous kernels)
     int nA = 0;
@@ -1019,7 +1160,7 @@ __device__ __forceinline__ void producer(const Params& P, uint8_t* smem, uint64_
         else wait_tokens(P, 0, 1);
     }   // (dense with nA >= 2 waited above; compact panels read xg -- gathered after the wait)
     if (P.dense && nA == 1) { TL1(0, 5); tma_load_2d(smem + STAGE_WS, &P.xmap, kts[0] * 128, 0, &full[0]); }
-    const unsigned epoch = __ldcg(P.work) + 1u, par = epoch & 1u;
+    const unsigned epoch = (TP2_EARLY_EPOCH ? (unsigned)T.misc[6] : __ldcg(P.work)) + 1u, par = epoch & 1u;
     int n = 0, ready_pid = -1;
     bool rows_ok = false;
     const unsigned C = (unsigned)T.misc[1] * (unsigned)(NKT1 * 8);
@@ -1610,24 +1751,39 @@ __device__ __forceinline__ void tail(const Params& P, const Tabs& T, int tid, un
         const int ntc = (M + TCH - 1) / TCH, nitem = NRT * ntc;
         volatile int* s_item = reinterpret_cast<volatile int*>(const_cast<int*>(T.misc) + 16);
         unsigned done_rt = 0u;   // row tiles known complete (thread 0)
+        // nitem <= G (M <= 8: 14 items): every CTA grabs exactly once -- the first nitem arrivals take one item each, the rest leave --
+        // so no second grab's round trip sits between the last item's messages and the exit
+        const bool one_grab = TP2_T1_ONE_GRAB && nitem <= G;
         for (;;) {
             if (tid == 0) {
                 const int it = (int)atomicAdd(P.fc2_next + 2 + par, 1u);
                 if (it < nitem) {
                     const int rt = it / ntc;
                     if (!((done_rt >> rt) & 1u)) { wait_ge(P.rt_cnt + par * NRT + rt, need); done_rt |= 1u << rt; }
+#ifdef TP2_LIGHT_STAMPS
+                    if (P.dbg && dbg_smem()[30] == 0ull) dbg_smem()[30] = gtimer();   // (stamps) first item's row tile wait done
+#endif
                 }
                 *s_item = it;
             }
             named_bar_sync(1, NCONS);
             const int it = *s_item;
             named_bar_sync(1, NCONS);   // (s_item reread by thread 0 next round only after everyone read it)
-            if (it >= nitem) break;
+            if (it >= nitem) {
+#ifdef TP2_LIGHT_STAMPS
+                STAMP(P, 4);   // (stamps) T1 queue exhausted
+#endif
+                break;
+            }
             const int rtile = it / ntc, t0 = (it - rtile * ntc) * TCH, nt = min(TCH, M - t0);
             for (int x = tid; x < nt * NMSG; x += NCONS) {
                 const int tt = x / NMSG, m = x - tt * NMSG;
                 t1_msg(P, T, rtile, t0 + tt, m, epoch);
             }
+#ifdef TP2_LIGHT_STAMPS
+            if (P.dbg && tid == 0 && dbg_smem()[31] == 0ull) dbg_smem()[31] = gtimer();   // (stamps) first item's messages issued
+#endif
+            if (one_grab) break;
         }
     } else if (!TP2_STREAM_TAIL) {
         const int npair = NRT * M, mine = b < npair ? (npair - b + G - 1) / G : 0;
@@ -1700,7 +1856,12 @@ __global__ void __launch_bounds__(NTHREADS, 1) tp8moe_kernel(const __grid_consta
     if (tid == 0) { g_tl_ptr = P.tl; g_tl_j = 0; g_tl_fc1 = 1; }
 #endif
     STAMP(P, 0);
+    if (TP2_EARLY_MAP_PF && tid == PROD_WARP * 32) {   // the weight tensor maps (host-written before this launch) into the descriptor cache during the
+#pragma unroll                                           // prologue: the producer's first TMA no longer waits for the 128-B descriptor fetch
+        for (int i = 0; i < 4; ++i) asm volatile("prefetch.tensormap [%0];" :: "l"(reinterpret_cast<uint64_t>(P.tmaps + i)) : "memory");
+    }
     const bool small_tab = P.M * P.topk <= 128 && P.M <= NMAX && TP2_SMALL_TABLES;
+    const bool bw_tab = small_tab && TP2_SMALL_TABLES_BW;   // block-wide small tables (warps 0..7, build_tables_small3)
     // fused quantization threads (small tables: warps 8..15; block-wide tables: the producer warpgroup).  x is complete before the
     // routing kernels (they read it) and the previous launch (same workspace) completed before them: with a PDL launch the
     // quantization starts before griddepcontrol.wait, overlapping the routing kernel's tail; every other thread waits first
@@ -1710,6 +1871,8 @@ __global__ void __launch_bounds__(NTHREADS, 1) tp8moe_kernel(const __grid_consta
     const bool early_xq = TP2_EARLY_XQ && P.xb && !P.dense && P.M <= TP2_EARLY_XQ_MAXM;
     if (!qpre && (!P.pdl_early || P.xb)) griddep_wait();   // (no-op when not PDL-launched; fused quantization: the routing is the previous kernel)
     STAMP(P, 35);   // (stamps) past the PDL wait: > start when launched before the previous kernel completed
+    unsigned ep_early = 0u;   // epoch counter (final: the previous launch completed): one pinned load now, stored to smem before the sync
+    if (TP2_EARLY_EPOCH && tid == 0) asm volatile("ld.global.cg.u32 %0, [%1];" : "=r"(ep_early) : "l"(P.work));
     if (tid < NST / KPS) mbar_init(&full[tid], 1u);   // the producer lane's expect_tx arrive (+ tx bytes)
     else if (tid >= 96 && tid < 96 + NRT) s_rtc[tid - 96] = 0;
     else if (tid >= 32 && tid < 32 + NST / KPS) mbar_init(&empty[tid - 32], (unsigned)(NCONS / 32));
@@ -1737,11 +1900,28 @@ __global__ void __launch_bounds__(NTHREADS, 1) tp8moe_kernel(const __grid_consta
         if (tid == NCONS) STAMPT(P, 40);
     }
     if (small_tab) {
-        if (warp == 0) { if (TP2_SMALL_TABLES == 2) build_tables_small2(P, smem, T); else build_tables_small(P, smem, T); }
+        if (TP2_TABLES_CHECK && bw_tab && tid < 256) {   // diagnostic: one-warp tables first, copied to the staging area, compared after the block-wide build
+            if (warp == 0) {
+                build_tables_small2(P, smem, T);
+                __syncwarp();
+                for (int i = tid; i < TAB_QQ / 4; i += 32) reinterpret_cast<uint32_t*>(smem + OFF_STG)[i] = reinterpret_cast<const uint32_t*>(smem + OFF_TAB)[i];
+            }
+            named_bar_sync(2, 256);
+        }
+        if (bw_tab) { if (tid < 256) build_tables_small3(P, smem, T); }
+        else if (warp == 0) { if (TP2_SMALL_TABLES == 2) build_tables_small2(P, smem, T); else build_tables_small(P, smem, T); }
+        if (TP2_TABLES_CHECK && bw_tab && tid < 256) {
+            named_bar_sync(2, 256);
+            int bad = 0;
+            for (int i = tid; i < TAB_QQ / 4; i += 256)
+                if (reinterpret_cast<uint32_t*>(smem + OFF_STG)[i] != reinterpret_cast<const uint32_t*>(smem + OFF_TAB)[i] && !(i >= TAB_FS / 4 && i < TAB_MISC / 4)) ++bad;   // (fs / am: not tables)
+            if (bad) atomicAdd(P.work + 3, (unsigned)bad);
+        }
     } else if (tid < NCONS) {   // consumer warps (named barrier 1); the producer warpgroup quantizes meanwhile
         build_tables(P, smem, T);
     }
     if (early_xq && tid >= NCONS) wait_tokens(P, tid - NCONS, NTHREADS - NCONS);   // every token's flag: the consumers' gather follows the sync
+    if (TP2_EARLY_EPOCH && tid == 0) T.misc[6] = (int)ep_early;
     fence_proxy_async_smem();       // prologue scratch (generic writes) precedes the ring's async-proxy writes
     __syncthreads();
     STAMP(P, 1);
@@ -1749,7 +1929,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) tp8moe_kernel(const __grid_consta
         setmaxnreg_dec<TP2_PROD_REGS>();
         if (warp == PROD_WARP) { if ((tid & 31) == 0) producer(P, smem, full, empty, T, s_unit, early_xs); return; }   // waits after pass A
         griddep_wait();
-        const unsigned epoch = __ldcg(P.work) + 1u, par = epoch & 1u;
+        const unsigned epoch = (TP2_EARLY_EPOCH ? (unsigned)T.misc[6] : __ldcg(P.work)) + 1u, par = epoch & 1u;
         if (blockIdx.x == 0) {   // next launch's parity set (unused by this launch; the previous launch has completed): warps 17..19
             const int t2 = tid - NCONS - 32;
             if (t2 < NRT) P.rt_cnt[(par ^ 1u) * NRT + t2] = 0u;
@@ -1776,7 +1956,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) tp8moe_kernel(const __grid_consta
     }
     setmaxnreg_inc<TP2_CONS_REGS>();
     griddep_wait();
-    const unsigned epoch = __ldcg(P.work) + 1u, par = epoch & 1u;
+    const unsigned epoch = (TP2_EARLY_EPOCH ? (unsigned)T.misc[6] : __ldcg(P.work)) + 1u, par = epoch & 1u;
     const Lane L = lane_of();
     const int G = gridDim.x, b = blockIdx.x;
     const int P_tot = T.misc[2];
@@ -1895,13 +2075,17 @@ __global__ void __launch_bounds__(NTHREADS, 1) tp8moe_kernel(const __grid_consta
         TACC(P, 31, t_rel);
     }
     STAMP(P, 3);
+    // CTA-done count (the last CTA advances the epoch for the next launch): issued before the tail so its round trip hides under T1 -- the
+    // next launch cannot start before this grid has ended, and every CTA read the epoch at its start, so the early bump is harmless
+    unsigned done_cnt = 0u;
+    if (TP2_EARLY_DONE && tid == 0) { fence_acq_rel_gpu(); done_cnt = atomicAdd(P.work + 1 + par, 1u); }
     tail(P, T, tid, epoch, par);
     STAMP(P, 6);
     if (TP2_STREAM_TAIL) named_bar_sync(6, NCONS + 32);   // + warp 18 (its streamed T1 is done)
     else named_bar_sync(1, NCONS);
     if (tid == 0) {
-        fence_acq_rel_gpu();
-        if (atomicAdd(P.work + 1 + par, 1u) == (unsigned)G - 1u) atomicAdd(P.work, 1u);   // last CTA out: next epoch
+        if (!TP2_EARLY_DONE) { fence_acq_rel_gpu(); done_cnt = atomicAdd(P.work + 1 + par, 1u); }
+        if (done_cnt == (unsigned)G - 1u) atomicAdd(P.work, 1u);   // last CTA out: next epoch
 #ifdef TP2_STAMPS
         if (P.dbg) { dbg_smem()[7] = gtimer(); dbg_smem()[26] = clock64() - dbg_smem()[26]; for (int i = 0; i < 48; ++i) P.dbg[blockIdx.x * NSTAMP + i] = dbg_smem()[i]; }
 #endif
@@ -2023,7 +2207,7 @@ void run(torch::Tensor xq, torch::Tensor xs, torch::Tensor w1, torch::Tensor s1,
     P.hseq = (unsigned)hseq;
     TORCH_CHECK((reinterpret_cast<uint64_t>(P.xq) & 15) == 0, "x must be 16-B aligned");
     {
-        static const int dense_maxm = getenv("TP2_DENSE_MAXM") ? atoi(getenv("TP2_DENSE_MAXM")) : 0;   // dense mode off by default (not tuned for this kernel)
+        static const int dense_maxm = getenv("TP2_DENSE_MAXM") ? atoi(getenv("TP2_DENSE_MAXM")) : TP2_DENSE_MAXM;
         P.dense = M <= dense_maxm ? 1 : 0;
         TORCH_CHECK(M <= OS_MAXM, "one-shot all-reduce only: M <= OS_MAXM");
         static const int groups_minm = getenv("TP2_GROUPS_MINM") ? atoi(getenv("TP2_GROUPS_MINM")) : 16;

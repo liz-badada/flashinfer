@@ -93,6 +93,52 @@ The torch + NCCL part (about 150-250 us: ~20 small kernels, two NCCL collectives
 to fuse; it is already the majority of the layer time.
 
 
+### Small-M latency work (M <= 8, single GPU; H20, 896 experts, graph of 32 back-to-back calls, min per call, us)
+
+| M | 1 | 2 | 4 | 8 |
+|---|---|---|---|---|
+| before (this cleaned kernel) | 35.8 | 45.6 | 64.0 | 91.7 |
+| after | 26.8 | 36.9 | 54.7 | 82.0 |
+| TP8 incl. the 8-way reduce, after (graph of 32 calls, worst-rank min) | 29.4 | 39.9 | 58.0 | 85.4 |
+| the same work on the pre-cleanup kernel (8b2451e1d): before / after | 38.7 / 28.5 | 48.2 / 39.1 | 66.7 / 57.0 | 94.3 / 84.4 |
+| of which (pre-cleanup kernel): block-wide small tables | -5.4 | -5.3 | -5.7 | -5.8 |
+| dense mode by default (`TP2_DENSE_MAXM` 8) | -2.5 | -1.5 | -2.5 | -2.3 |
+| T1 one grab per CTA, epoch / done atomics off the critical path, tensor-map prefetch | -2.3 | -2.3 | -1.5 | -1.8 |
+
+Outputs are unchanged (same rel RMS vs the torch reference at every M, two calls bitwise identical; the tables of the new builder were
+compared word for word against the one-warp builder for M = 1..8 x 4 routings including duplicate slots and an invalid id, compact and
+dense: 0 differences). M = 1 is pure latency, so these numbers transfer to H200 (not re-measured there).
+
+What the M = 1 timeline looked like (`-DTP2_STAMPS -DTP2_LIGHT_STAMPS`, globaltimer, median over CTAs, us from kernel start) before -> after
+(pre-cleanup kernel; this kernel in brackets): tables 10.0 -> 3.7 (2.5), consumers at FC1 13.5 -> 4.3 (2.8), first FC1 stage consumed ~14.5 -> 5.9 (4.4),
+FC1 done 25.3 -> 16.7 (15.1; max 27.6 -> 18.3), FC2 done 35.0 -> 25.7 (23.9), exit 36.3 -> 26.9 (25.2; max 39.2 -> 29.2 (27.5)).
+
+- **Block-wide small tables** (`build_tables_small3`, `TP2_SMALL_TABLES_BW`). The one-warp bitmap builder scanned 896 / 32 = 28 experts
+  per lane in unrolled loops: ~12k cycles at M = 1, mostly cold i-cache misses on ~15 KB of straight-line code (6.4 us of the 10 us
+  prologue). Now warps 0..7 build the same tables: each thread owns experts tid + 256 r (4 rounds), the 4 rounds' warp scans run together
+  with (present, count, padded rows) packed in one word, the (round, warp) sums are prefix-summed by one more warp scan (no serial loop,
+  one barrier), entries and stream-K bounds one per thread. 3.1 us for the whole prologue; `-DTP2_TABLES_CHECK=1` builds both and counts
+  differing table words into `work[3]`.
+- **Dense mode at M <= 8** (host default `TP2_DENSE_MAXM` 8, env override). Every panel's FC1 B operand is x rows 0..7 by TMA straight from
+  xq (OOB rows zero-filled) instead of the grid-wide gather into xg + `xg_cnt` round trips; at M <= 8 every panel is N8 either way, so
+  the MMA work is identical. The 3.3 us gather chain between the tables and the first FC1 stage is gone (-2.5 us at M = 1).
+- **Tail**: with <= 78 T1 items (M <= 8) every CTA grabs exactly once (the first 14 arrivals take one row tile each), so the last item's
+  messages are not followed by a second queue round trip; the CTA-done atomic is issued before T1 (its return consumed after); the epoch
+  counter is loaded once at kernel start into smem (pinned load, latency under the table build) instead of by every role after the sync;
+  the 4 weight tensor maps are prefetched at kernel start.
+
+Measured and rejected (numbers at M = 1 unless noted): per-row x TMA (`TP2_ROWX` 2: 39.2 vs 38.9); two panel groups (`TP2_GROUPS_MINM=1`:
+38.5); CTA-local quantization (`TP2_LQUANT_MAXM` 2 / 8: +0.3 / +0.4 -- the token flag is hidden under the tables); PDL launch (no
+`launch_dependents` in the kernel: 0); dense epilogue credit in the stream-K cost (`TP2_EPI_SCALE_DENSE` 100 / 200: -0.2 / 0.0, although
+owner CTAs finish FC1 1.5-2 us after non-owners); an early pass issuing 1-7 stages of weight TMAs from the producer warp during the table
+build (`TP2_EARLY_TMA`, it sorts the <= 32 ids itself: +0.8..+1.2 us -- the burst is HBM-bound either way and the queued TMA requests held
+up the producer's `setmaxnreg` after the sync); grabbing the next T1 item ahead (the first CTAs took two items each: +2 us); two or four
+lanes per T1 message (0 at M = 1, +0.6 / +3 us at M = 4 / 8); an out-of-line T1 message warmed up by warp 18 during FC2 (+6 us: the call
+wrecks the register allocation). What remains at M = 1: 1.3 us for the first global load (ids) and ~0.5 us cold-code costs at each phase
+start, FC1 10.8 us (17 k-tiles at 0.65 us: dequant-ALU / handshake bound), the FC1 -> FC2 chain 3.2 us (owner epilogue 0.4, pan_cnt
+atomic 0.7, panel quantization 0.6, h flag -> producer 0.4, hq bulk copy 0.4) plus 1.6 us of FC1 imbalance, FC2 5.8 us (3 units per
+CTA), T1 2.9 us (one message's 48 scattered loads + the barriers, cold), 2.6 us launch gap in the graph.
+
 ## Results on H200 (computelab, 1 and 8 GPUs; synthetic weights)
 
 Jobs 5367215 / 5369265 (1 GPU: ipp2-0042, smc-522ga-0030), 5365960 / 5369818 (8 GPUs: viking-prod-322, viking-cr-194),
