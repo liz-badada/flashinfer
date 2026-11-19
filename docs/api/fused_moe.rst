@@ -7,6 +7,28 @@ flashinfer.fused_moe
 
 This module provides fused Mixture-of-Experts (MoE) operations optimized for different backends and data types.
 
+SM90 Latent MoE TP4
+-------------------
+
+``LatentMoeTP4`` executes the latent down/up projections, routed expert shards,
+SiTU-GLU, a shared FFN, gate mixing and TP4 SUM on four GPUs on one host.
+Routing is supplied by the caller. Construct and prepare the workspace
+collectively before CUDA graph capture, and close graphs before the workspace.
+Weights use E4M3 values and FP32 multiplier scales for each 128-by-128 block.
+Dimensions, launch parameters, cache policies and communication capacities
+are explicit.
+
+.. autosummary::
+    :toctree: ../generated
+
+    FP8BlockWeight
+    LatentMoeProjectionConfig
+    LatentMoeTP4Config
+    LatentMoeTP4Weights
+    LatentMoeTP4
+    LatentMoeTP4Graph
+    shard_fp8_experts_tp4
+
 Types and Enums
 ---------------
 

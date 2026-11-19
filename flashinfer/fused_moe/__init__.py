@@ -146,7 +146,24 @@ try:
 except ImportError:
     _cute_dsl_available = False
 
+from .sm90_latent_tp4 import (
+    FP8BlockWeight as FP8BlockWeight,
+    LatentMoeProjectionConfig as LatentMoeProjectionConfig,
+    LatentMoeTP4 as LatentMoeTP4,
+    LatentMoeTP4Config as LatentMoeTP4Config,
+    LatentMoeTP4Graph as LatentMoeTP4Graph,
+    LatentMoeTP4Weights as LatentMoeTP4Weights,
+    shard_fp8_experts_tp4 as shard_fp8_experts_tp4,
+)
+
 __all__ = [
+    "FP8BlockWeight",
+    "LatentMoeProjectionConfig",
+    "LatentMoeTP4",
+    "LatentMoeTP4Config",
+    "LatentMoeTP4Graph",
+    "LatentMoeTP4Weights",
+    "shard_fp8_experts_tp4",
     # Unified API
     "ActivationConfig",
     "B12xNvfp4Config",
