@@ -1,6 +1,6 @@
 # SM90 Latent MoE TP4 kernels
 
-This is a preview for integration and synthetic validation. The current checks cover four H20 GPUs (SM90); H200 configuration and performance qualification remains pending.
+This is an integration preview. Four-GPU correctness checks and performance measurements have been completed on H20 and H200 (SM90).
 
 Tested dependencies: Python 3.12, PyTorch 2.14.1+cu130, Triton 3.8.0 and FlashInfer 0.7.1.
 
