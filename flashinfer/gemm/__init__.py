@@ -22,6 +22,7 @@ from .gemm_base import gemm_fp8_nt_blockscaled as gemm_fp8_nt_blockscaled
 from .gemm_base import gemm_fp8_nt_groupwise as gemm_fp8_nt_groupwise
 from .gemm_base import group_gemm_fp8_nt_groupwise as group_gemm_fp8_nt_groupwise
 from .gemm_base import fp8_blockscale_gemm_sm90 as fp8_blockscale_gemm_sm90
+from .sm90_fp8_projection import SM90FP8Projection as SM90FP8Projection
 
 from .gemm_bf16_fp4 import (
     mm_bf16_fp4 as mm_bf16_fp4,
@@ -128,6 +129,7 @@ __all__ = (
         "gemm_fp8_nt_groupwise",
         "group_gemm_fp8_nt_groupwise",
         "fp8_blockscale_gemm_sm90",
+        "SM90FP8Projection",
         "mm_bf16_fp4",
         "prepare_bf16_fp4_weights",
         "mm_M1_16_K6144_N256",

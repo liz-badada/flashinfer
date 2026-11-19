@@ -66,6 +66,7 @@ FP8 GEMM
     group_deepgemm_fp8_nt_groupwise
     batch_deepgemm_fp8_nt_groupwise
     fp8_blockscale_gemm_sm90
+    SM90FP8Projection
 
 Low-latency TRT-LLM FP8 GEMM weight prep (also exported from ``flashinfer``):
 
